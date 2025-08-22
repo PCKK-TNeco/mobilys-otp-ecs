@@ -1,0 +1,53 @@
+# copilot/web/manifest.yml
+name: web
+type: Load Balanced Web Service
+cpu: 1024
+memory: 2048
+image:
+  # Build the nginx container from ./nginx/Dockerfile
+  build: ./nginx/Dockerfile
+  context: ./nginx
+  port: 8080
+
+# Health check used by ALB -> nginx
+http:
+  path: '/'
+  healthcheck:
+    path: '/health'
+    healthy_threshold: 2
+    unhealthy_threshold: 2
+    interval: 10s
+    timeout: 5s
+
+# Sidecar: FastAPI
+sidecars:
+  api:
+    image:
+      # Build the FastAPI image from the repo root Dockerfile.fastapi
+      build: ./Dockerfile.fastapi
+    port: 8001
+    variables:
+      AWS_REGION: ap-northeast-1
+    env_file: ./copilot/web/api.env
+    mount_points:
+      - source_volume: shared
+        path: /shared
+
+# Runtime env for the nginx container
+variables:
+  NGINX_SNIPPETS_DIR: /shared/nginx/routers
+env_file: ./copilot/web/web.env
+
+# Writable ephemeral volume shared between nginx and api
+storage:
+  volumes:
+    shared:
+      path: /shared 
+      read_only: false
+
+# Also mount the same volume into the main container
+mount_points:
+  - source_volume: shared
+    path: /shared
+
+
