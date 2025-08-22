@@ -1,0 +1,52 @@
+name: Build OTP images
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'otp/**'
+      - '.github/workflows/otp-images.yml'
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPO_BUILDER: mobilys-otp/otp-builder
+  ECR_REPO_ROUTER: mobilys-otp/otp-router
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write     # for OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Option A: OIDC role (recommended)
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<GitHubOIDC-Role>
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Option B (if not using OIDC): replace the step above with:
+      # - uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region:            ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+
+      - name: Ensure repos exist
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO_BUILDER" || aws ecr create-repository --repository-name "$ECR_REPO_BUILDER"
+          aws ecr describe-repositories --repository-names "$ECR_REPO_ROUTER"  || aws ecr create-repository --repository-name "$ECR_REPO_ROUTER"
+
+      - name: Build & push builder
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_BUILDER }}:latest -f otp/Dockerfile.builder .
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_BUILDER }}:latest
+
+      - name: Build & push router
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_ROUTER }}:latest -f otp/Dockerfile.router .
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_ROUTER }}:latest

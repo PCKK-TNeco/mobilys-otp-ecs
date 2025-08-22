@@ -1,20 +1,17 @@
+# app/main.py
 import os
-from urllib.parse import quote
-
 import boto3
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
-from fastapi.responses import JSONResponse
 
 from app.ecs_control import (
-    submit_builder_async,
-    get_task_status,
+    submit_builder_and_wait,
     ensure_router_service,
     delete_router_service,
 )
 
 app = FastAPI()
 
-# --- env ---
+# --- Config from env ---
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
 GRAPHS_BUCKET = os.getenv("GRAPHS_BUCKET")
 OSM_PREFIX = os.getenv("OSM_PREFIX", "preloaded_osm_files")
@@ -33,6 +30,10 @@ BUILDER_IMAGE       = os.getenv("BUILDER_IMAGE") or None
 
 SNIPPETS_DIR = os.getenv("NGINX_SNIPPETS_DIR", "/shared/nginx/routers").rstrip("/")
 
+# Logs groups (must exist)
+LOG_GROUP_BUILDER = os.getenv("LOG_GROUP_BUILDER", "/mobilys-otp/builder")
+LOG_GROUP_ROUTER  = os.getenv("LOG_GROUP_ROUTER", "/mobilys-otp/router")
+
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 
@@ -44,8 +45,7 @@ def _require(cond, msg):
 def _write_nginx_snippet(scenario_id: str, host: str, port: int = 8081):
     os.makedirs(SNIPPETS_DIR, exist_ok=True)
     path = f"{SNIPPETS_DIR}/{scenario_id}.conf"
-    with open(path, "w") as f:
-        f.write(f"""
+    conf = f"""
 # generated for {scenario_id}
 location /router/{scenario_id}/ {{
   proxy_set_header Host $host;
@@ -53,7 +53,9 @@ location /router/{scenario_id}/ {{
   proxy_http_version 1.1;
   proxy_pass http://{host}:{port}/;
 }}
-""".lstrip())
+""".lstrip()
+    with open(path, "w") as f:
+        f.write(conf)
     return path
 
 
@@ -64,30 +66,35 @@ def _remove_nginx_snippet(scenario_id: str):
         pass
 
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.post("/build_graph")
 async def build_graph(
     scenario_id: str = Form(...),
     prefecture: str = Form(...),
     gtfs_file: UploadFile = File(...),
 ):
-    # quick validations
+    """Synchronous: build Graph.obj in a one-off task, then bring up router service and route traffic."""
     _require(GRAPHS_BUCKET, "GRAPHS_BUCKET not set")
     _require(ECS_CLUSTER_ARN and ECS_SUBNETS and ECS_SGS, "ECS cluster/subnets/SGs not set")
     _require(CLOUDMAP_NAMESPACE_ID, "Cloud Map namespace not set")
     _require(BUILDER_IMAGE, "BUILDER_IMAGE not set")
     _require(ROUTER_IMAGE, "ROUTER_IMAGE not set")
 
-    # 1) upload GTFS
+    # Upload GTFS to s3://bucket/gtfs/<scenario>/<filename>
     gtfs_key = f"gtfs/{scenario_id}/{gtfs_file.filename}"
     s3.upload_fileobj(gtfs_file.file, GRAPHS_BUCKET, gtfs_key)
 
-    # 2) fire builder task and return 202 + jobArn
-    task_arn = submit_builder_async(
+    # Run builder task and wait
+    ok, tail = submit_builder_and_wait(
         region=AWS_REGION,
         cluster_arn=ECS_CLUSTER_ARN,
         subnets=ECS_SUBNETS,
         security_groups=ECS_SGS,
-        cloudwatch_log_group="/mobilys-otp/builder",
+        cloudwatch_log_group=LOG_GROUP_BUILDER,
         task_family=BUILDER_TASK_FAMILY,
         task_exec_role_arn=TASK_EXEC_ROLE_ARN,
         task_role_arn=TASK_ROLE_ARN,
@@ -101,38 +108,11 @@ async def build_graph(
             "S3_GTFS_URI": f"s3://{GRAPHS_BUCKET}/{gtfs_key}",
         },
     )
+    if not ok:
+        # include last lines for debugging
+        raise HTTPException(status_code=500, detail="Graph build failed")
 
-    return JSONResponse(
-        status_code=202,
-        content={
-            "message": "build started",
-            "jobArn": task_arn,
-            "scenario_id": scenario_id,
-            "status_url": f"/api/build_status?jobArn={quote(task_arn)}&scenario_id={quote(scenario_id)}",
-        },
-    )
-
-
-@app.get("/build_status")
-async def build_status(jobArn: str, scenario_id: str):
-    """
-    Poll this until {"state":"SUCCEEDED"} (or "FAILED").
-    On success, this will also ensure the router service is running and return its path.
-    """
-    _require(ROUTER_IMAGE, "ROUTER_IMAGE not set")
-
-    st = get_task_status(region=AWS_REGION, cluster_arn=ECS_CLUSTER_ARN, task_arn=jobArn)
-    last = st["lastStatus"]
-    code = st["exitCode"]
-
-    if last != "STOPPED":
-        # still building
-        return {"state": last or "UNKNOWN"}
-
-    if code != 0:
-        return JSONResponse(status_code=500, content={"state": "FAILED", "exitCode": code})
-
-    # success: bring up router and wire nginx
+    # Ensure router service is running
     dns = ensure_router_service(
         region=AWS_REGION,
         cluster_arn=ECS_CLUSTER_ARN,
@@ -152,10 +132,23 @@ async def build_status(jobArn: str, scenario_id: str):
         },
         desired_count=1,
         container_port=8081,
-        cw_log_group="/mobilys-otp/router",
+        cw_log_group=LOG_GROUP_ROUTER,
     )
+
+    # Add nginx route (hot-reload sidecar handles reload)
     _write_nginx_snippet(scenario_id, dns, 8081)
-    return {"state": "SUCCEEDED", "router": f"/router/{scenario_id}/"}
+
+    return {"status": "success", "router_path": f"/router/{scenario_id}/"}
+
+
+@app.post("/edit_graph")
+async def edit_graph(
+    scenario_id: str = Form(...),
+    prefecture: str = Form(...),
+    gtfs_file: UploadFile = File(...),
+):
+    # For now: same flow as build (rebuild then ensure router)
+    return await build_graph(scenario_id, prefecture, gtfs_file)
 
 
 @app.post("/delete_graph")
