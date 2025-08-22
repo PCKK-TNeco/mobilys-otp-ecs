@@ -23,7 +23,7 @@ jobs:
       # Option A: OIDC role (recommended)
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<GitHubOIDC-Role>
+          role-to-assume: arn:aws:iam::892356203670:role/<GitHubOIDC-Role>
           aws-region: ${{ env.AWS_REGION }}
 
       # Option B (if not using OIDC): replace the step above with:
