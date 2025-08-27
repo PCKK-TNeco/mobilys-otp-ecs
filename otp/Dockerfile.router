@@ -1,24 +1,36 @@
-FROM eclipse-temurin:17-jre-jammy
-
+FROM eclipse-temurin:11-jre
 WORKDIR /otp
 
-# put the OTP shaded jar here (you provide this file)
+# --- Provide the OTP shaded jar in the build context ---
 COPY otp-1.5.0-shaded.jar /otp/otp-1.5.0-shaded.jar
 
-# AWS CLI for S3 download of Graph.obj
-RUN python -m pip install --no-cache-dir awscli
+# --- Install AWS CLI v2 ---
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+ && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip" \
+ && unzip /tmp/awscliv2.zip -d /tmp \
+ && /tmp/aws/install \
+ && rm -rf /var/lib/apt/lists/* /tmp/aws /tmp/awscliv2.zip
 
-ENV JAVA_OPTS="-Xmx4G"
+# JVM heap (router is lighter than builder, but you can bump if needed)
+ENV JAVA_OPTS="-Xmx4g"
+
+# ECS runtime env
 ENV GRAPH_SCENARIO_ID=""
 ENV GRAPHS_BUCKET=""
 ENV AWS_REGION="ap-northeast-1"
 
 EXPOSE 8081
 
-CMD ["/bin/sh","-lc","set -e; \
-  test -n \"$GRAPH_SCENARIO_ID\" || (echo 'GRAPH_SCENARIO_ID not set' && exit 1); \
-  test -n \"$GRAPHS_BUCKET\" || (echo 'GRAPHS_BUCKET not set' && exit 1); \
-  mkdir -p /graphs/$GRAPH_SCENARIO_ID; \
-  echo \"Downloading s3://$GRAPHS_BUCKET/graphs/$GRAPH_SCENARIO_ID/Graph.obj\"; \
-  aws s3 cp s3://$GRAPHS_BUCKET/graphs/$GRAPH_SCENARIO_ID/Graph.obj /graphs/$GRAPH_SCENARIO_ID/Graph.obj --region $AWS_REGION; \
-  exec java $JAVA_OPTS -jar /otp/otp-1.5.0-shaded.jar --load /graphs/$GRAPH_SCENARIO_ID --port 8081" ]
+CMD ["/bin/sh","-lc","\
+  set -eu; \
+  : ${GRAPH_SCENARIO_ID:?GRAPH_SCENARIO_ID not set}; \
+  : ${GRAPHS_BUCKET:?GRAPHS_BUCKET not set}; \
+  : ${AWS_REGION:?AWS_REGION not set}; \
+  mkdir -p /graphs/${GRAPH_SCENARIO_ID}; \
+  echo \"Downloading s3://${GRAPHS_BUCKET}/graphs/${GRAPH_SCENARIO_ID}/Graph.obj\"; \
+  aws s3 cp s3://${GRAPHS_BUCKET}/graphs/${GRAPH_SCENARIO_ID}/Graph.obj /graphs/${GRAPH_SCENARIO_ID}/Graph.obj --region ${AWS_REGION}; \
+  echo \"Starting OTP router on :8081\"; \
+  exec java ${JAVA_OPTS} -jar /otp/otp-1.5.0-shaded.jar --load /graphs/${GRAPH_SCENARIO_ID} --port 8081 \
+"]
+

@@ -106,6 +106,7 @@ async def build_graph(
             "SCENARIO_ID": scenario_id,
             "PREFECTURE": prefecture,
             "S3_GTFS_URI": f"s3://{GRAPHS_BUCKET}/{gtfs_key}",
+            "JAVA_TOOL_OPTIONS": "-Xmx8g -XX:+UseG1GC"
         },
     )
     if not ok:

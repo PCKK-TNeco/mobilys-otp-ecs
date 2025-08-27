@@ -4,3 +4,4 @@ __pycache__/
 copilot/web/*.env
 otp/otp-1.5.0-shaded.jar
 copilot/_packaged/
+preloaded_osm_files/
