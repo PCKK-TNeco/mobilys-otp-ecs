@@ -1,0 +1,31 @@
+{
+  "family": "otp-router",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "6144",
+  "executionRoleArn": "arn:aws:iam::892356203670:role/mobilys-otp-mobilys-staging-web-ExecutionRole-7cdEiSNAF8bV",
+  "taskRoleArn": "arn:aws:iam::892356203670:role/mobilys-otp-mobilys-staging-web-TaskRole-GruyXEJmECzh",
+  "containerDefinitions": [
+    {
+      "name": "router",
+      "image": "892356203670.dkr.ecr.ap-northeast-1.amazonaws.com/mobilys-otp/otp-router:latest",
+      "essential": true,
+      "portMappings": [{"containerPort": 8081, "protocol": "tcp"}],
+      "environment": [
+        { "name": "AWS_REGION",     "value": "ap-northeast-1" },
+        { "name": "GRAPHS_BUCKET",  "value": "mobilys-osm-files" },
+        { "name": "GRAPH_PREFIX",   "value": "graphs" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/mobilys-otp/router",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "router",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

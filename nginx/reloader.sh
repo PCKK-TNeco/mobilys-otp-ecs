@@ -1,21 +1,24 @@
 #!/bin/sh
-# Watches router snippets and reloads nginx when they change.
+set -eu
+
 SNIPPET_DIR="/shared/nginx/routers"
 mkdir -p "$SNIPPET_DIR"
 
-inotifywait() {
-  # Busybox inotify-tools may not be present. Polling fallback every 2s.
-  while true; do
-    sleep 2
-    find "$SNIPPET_DIR" -type f -print0 2>/dev/null | xargs -0 stat -c "%n %Y" 2>/dev/null > /tmp/snap.new
-    if [ -f /tmp/snap.old ]; then
-      if ! cmp -s /tmp/snap.new /tmp/snap.old; then
-        mv /tmp/snap.new /tmp/snap.old
-        nginx -s reload 2>/dev/null || true
-      fi
-    else
+echo "[reloader] watching $SNIPPET_DIR"
+while true; do
+  sleep 2
+  find "$SNIPPET_DIR" -type f -print0 2>/dev/null | xargs -0 stat -c "%n %Y" 2>/dev/null > /tmp/snap.new || true
+  if [ -f /tmp/snap.old ]; then
+    if ! cmp -s /tmp/snap.new /tmp/snap.old; then
       mv /tmp/snap.new /tmp/snap.old
+      echo "[reloader] change detected -> nginx -t && nginx -s reload"
+      if nginx -t; then
+        nginx -s reload || true
+      else
+        echo "[reloader] nginx -t failed; not reloading"
+      fi
     fi
-  done
-}
-inotifywait
+  else
+    mv /tmp/snap.new /tmp/snap.old || true
+  fi
+done

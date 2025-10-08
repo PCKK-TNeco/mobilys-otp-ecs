@@ -4,8 +4,8 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "2048",
   "memory": "12288",
-  "executionRoleArn": "arn:aws:iam::892356203670:role/mobilys-otp-staging-env-web-ExecutionRole-77qwQ0ENrszO",
-  "taskRoleArn": "arn:aws:iam::892356203670:role/mobilys-otp-staging-env-web-TaskRole-YaaDpPlalbFj",
+  "executionRoleArn": "arn:aws:iam::892356203670:role/mobilys-otp-mobilys-staging-web-ExecutionRole-7cdEiSNAF8bV",
+  "taskRoleArn": "arn:aws:iam::892356203670:role/mobilys-otp-mobilys-staging-web-TaskRole-GruyXEJmECzh",
   "containerDefinitions": [
     {
       "name": "builder",

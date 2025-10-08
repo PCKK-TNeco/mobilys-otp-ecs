@@ -20,7 +20,7 @@ ENV GRAPH_SCENARIO_ID=""
 ENV GRAPHS_BUCKET=""
 ENV AWS_REGION="ap-northeast-1"
 
-EXPOSE 8081
+EXPOSE 8081 8443
 
 CMD ["/bin/sh","-lc","\
   set -eu; \
@@ -30,7 +30,12 @@ CMD ["/bin/sh","-lc","\
   mkdir -p /graphs/${GRAPH_SCENARIO_ID}; \
   echo \"Downloading s3://${GRAPHS_BUCKET}/graphs/${GRAPH_SCENARIO_ID}/Graph.obj\"; \
   aws s3 cp s3://${GRAPHS_BUCKET}/graphs/${GRAPH_SCENARIO_ID}/Graph.obj /graphs/${GRAPH_SCENARIO_ID}/Graph.obj --region ${AWS_REGION}; \
-  echo \"Starting OTP router on :8081\"; \
-  exec java ${JAVA_OPTS} -jar /otp/otp-1.5.0-shaded.jar --load /graphs/${GRAPH_SCENARIO_ID} --port 8081 \
+  echo \"Starting OTP 1.5 on :8081 (router=${GRAPH_SCENARIO_ID})\"; \
+  exec java ${JAVA_OPTS} -jar /otp/otp-1.5.0-shaded.jar \
+       --server \
+       --graphs /graphs \
+       --router ${GRAPH_SCENARIO_ID} \
+       --port 8081 --securePort 8443 \
+       --analyst \
 "]
 

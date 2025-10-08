@@ -8,13 +8,14 @@ from app.ecs_control import (
     ensure_router_service,
     delete_router_service,
 )
+from botocore.exceptions import ClientError
+from typing import Literal
 
 app = FastAPI()
 
 # --- Config from env ---
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
 GRAPHS_BUCKET = os.getenv("GRAPHS_BUCKET")
-OSM_PREFIX = os.getenv("OSM_PREFIX", "preloaded_osm_files")
 
 ECS_CLUSTER_ARN = os.getenv("ECS_CLUSTER_ARN")
 ECS_SUBNETS = [s.strip() for s in os.getenv("ECS_SUBNETS", "").split(",") if s.strip()]
@@ -65,6 +66,80 @@ def _remove_nginx_snippet(scenario_id: str):
     except FileNotFoundError:
         pass
 
+def _bucket_is_versioned(bucket: str) -> bool:
+    try:
+        v = s3.get_bucket_versioning(Bucket=bucket)
+        return v.get("Status") in ("Enabled", "Suspended")
+    except Exception:
+        return False
+
+
+def _delete_prefix_unversioned(bucket: str, prefix: str) -> dict:
+    deleted = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        if objs:
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs, "Quiet": True})
+            deleted += len(objs)
+    # remove the “folder” marker if it exists
+    try:
+        s3.delete_object(Bucket=bucket, Key=prefix)
+    except Exception:
+        pass
+    return {"objects": deleted}
+
+
+def _delete_prefix_versioned(bucket: str, prefix: str) -> dict:
+    versions = 0
+    markers = 0
+    paginator = s3.get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        batch = []
+        for v in page.get("Versions", []):
+            batch.append({"Key": v["Key"], "VersionId": v["VersionId"]})
+        versions += len(page.get("Versions", []))
+        for m in page.get("DeleteMarkers", []):
+            batch.append({"Key": m["Key"], "VersionId": m["VersionId"]})
+        markers += len(page.get("DeleteMarkers", []))
+        for i in range(0, len(batch), 1000):
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": batch[i:i+1000], "Quiet": True})
+    try:
+        s3.delete_object(Bucket=bucket, Key=prefix)
+    except Exception:
+        pass
+    return {"versions": versions, "delete_markers": markers}
+
+
+def _delete_prefix(bucket: str, prefix: str) -> dict:
+    return (
+        _delete_prefix_versioned(bucket, prefix)
+        if _bucket_is_versioned(bucket)
+        else _delete_prefix_unversioned(bucket, prefix)
+    )
+
+
+@app.get("/s3/pbf_files")
+def list_pbf_files(bucket: str):
+
+    _require(bucket, "Bucket name is required")
+    try:
+        resp = s3.list_objects_v2(Bucket=bucket)
+    except s3.exceptions.NoSuchBucket:
+        raise HTTPException(status_code=404, detail=f"Bucket '{bucket}' not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    items = []
+    for obj in resp.get("Contents", []):
+        key = obj["Key"]
+        if key.lower().endswith((".pbf", ".osm")):
+            name = key.rsplit("/", 1)[-1]  # take only the filename
+            base = os.path.splitext(name)[0]
+            items.append(base)
+
+    return {"file_names": sorted(items)}
+
 
 @app.get("/health")
 def health():
@@ -76,6 +151,7 @@ async def build_graph(
     scenario_id: str = Form(...),
     prefecture: str = Form(...),
     gtfs_file: UploadFile = File(...),
+    graph_type: Literal["osm", "drm"] = Form("osm", alias="type"),  # <-- NEW
 ):
     """Synchronous: build Graph.obj in a one-off task, then bring up router service and route traffic."""
     _require(GRAPHS_BUCKET, "GRAPHS_BUCKET not set")
@@ -84,11 +160,20 @@ async def build_graph(
     _require(BUILDER_IMAGE, "BUILDER_IMAGE not set")
     _require(ROUTER_IMAGE, "ROUTER_IMAGE not set")
 
+    # Pick prefix + extension from the requested type
+    if graph_type == "osm":
+        osm_prefix = "preloaded_osm_files"
+        osm_ext = ".osm.pbf"
+    else:  # "drm"
+        osm_prefix = "preloaded_drm_files"
+        osm_ext = ".osm"
+
     # Upload GTFS to s3://bucket/gtfs/<scenario>/<filename>
     gtfs_key = f"gtfs/{scenario_id}/{gtfs_file.filename}"
     s3.upload_fileobj(gtfs_file.file, GRAPHS_BUCKET, gtfs_key)
 
     # Run builder task and wait
+    print("[builder] submit_builder_and_wait: ENTER")
     ok, tail = submit_builder_and_wait(
         region=AWS_REGION,
         cluster_arn=ECS_CLUSTER_ARN,
@@ -102,62 +187,91 @@ async def build_graph(
         env={
             "AWS_REGION": AWS_REGION,
             "GRAPHS_BUCKET": GRAPHS_BUCKET,
-            "OSM_PREFIX": OSM_PREFIX,
+            "OSM_PREFIX": osm_prefix, 
+            "OSM_EXT": osm_ext, 
             "SCENARIO_ID": scenario_id,
             "PREFECTURE": prefecture,
             "S3_GTFS_URI": f"s3://{GRAPHS_BUCKET}/{gtfs_key}",
-            "JAVA_TOOL_OPTIONS": "-Xmx8g -XX:+UseG1GC"
+            "JAVA_TOOL_OPTIONS": "-Xmx8g -XX:+UseG1GC",
         },
     )
+    print(f"[builder] submit_builder_and_wait: EXIT ok={ok}")
     if not ok:
         # include last lines for debugging
         raise HTTPException(status_code=500, detail="Graph build failed")
 
-    # Ensure router service is running
-    dns = ensure_router_service(
-        region=AWS_REGION,
-        cluster_arn=ECS_CLUSTER_ARN,
-        subnets=ECS_SUBNETS,
-        security_groups=ECS_SGS,
-        cloudmap_namespace_id=CLOUDMAP_NAMESPACE_ID,
-        service_prefix="router",
-        scenario_id=scenario_id,
-        task_family=ROUTER_TASK_FAMILY,
-        task_exec_role_arn=TASK_EXEC_ROLE_ARN,
-        task_role_arn=TASK_ROLE_ARN,
-        image=ROUTER_IMAGE,
-        env={
-            "AWS_REGION": AWS_REGION,
-            "GRAPHS_BUCKET": GRAPHS_BUCKET,
-            "GRAPH_SCENARIO_ID": scenario_id,
-        },
-        desired_count=1,
-        container_port=8081,
-        cw_log_group=LOG_GROUP_ROUTER,
-    )
+    # Ensure router service is running (DEBUG logs)
+    print(f"[router] calling ensure_router_service for scenario_id={scenario_id}")
+    try:
+        dns = ensure_router_service(
+            region=AWS_REGION,
+            cluster_arn=ECS_CLUSTER_ARN,
+            subnets=ECS_SUBNETS,
+            security_groups=ECS_SGS,
+            cloudmap_namespace_id=CLOUDMAP_NAMESPACE_ID,
+            service_prefix="router",
+            scenario_id=scenario_id,
+            task_family=ROUTER_TASK_FAMILY,
+            task_exec_role_arn=TASK_EXEC_ROLE_ARN,
+            task_role_arn=TASK_ROLE_ARN,
+            image=ROUTER_IMAGE,
+            env={
+                "AWS_REGION": AWS_REGION,
+                "GRAPHS_BUCKET": GRAPHS_BUCKET,
+                "GRAPH_SCENARIO_ID": scenario_id,
+            },
+            desired_count=1,
+            container_port=8081,
+            cw_log_group=LOG_GROUP_ROUTER,
+        )
+    except ClientError as e:
+        # print full AWS error so we see *exactly* why CreateService/RegisterTaskDefinition failed
+        print("[router] ensure_router_service ClientError:", e.response)
+        raise HTTPException(status_code=500, detail=f"router-create failed: {e.response.get('Error', {})}")
+    except Exception as e:
+        print("[router] ensure_router_service Exception:", repr(e))
+        raise
+
+    print(f"[router] ensure_router_service OK; dns={dns}")
 
     # Add nginx route (hot-reload sidecar handles reload)
     _write_nginx_snippet(scenario_id, dns, 8081)
 
     return {"status": "success", "router_path": f"/router/{scenario_id}/"}
 
-
-@app.post("/edit_graph")
-async def edit_graph(
-    scenario_id: str = Form(...),
-    prefecture: str = Form(...),
-    gtfs_file: UploadFile = File(...),
-):
-    # For now: same flow as build (rebuild then ensure router)
-    return await build_graph(scenario_id, prefecture, gtfs_file)
-
-
 @app.post("/delete_graph")
 async def delete_graph(scenario_id: str = Form(...)):
-    delete_router_service(
-        region=AWS_REGION,
-        cluster_arn=ECS_CLUSTER_ARN,
-        service_name=f"router-{scenario_id}",
-    )
+    # 1) Kill the router service (ignore if it's already gone)
+    try:
+        delete_router_service(
+            region=AWS_REGION,
+            cluster_arn=ECS_CLUSTER_ARN,
+            service_name=f"router-{scenario_id}",
+        )
+    except Exception as e:
+        print(f"[delete_graph] delete_router_service warning: {e}")
+
+    # 2) Remove nginx snippet
     _remove_nginx_snippet(scenario_id)
-    return {"status": "success"}
+
+    # 3) Purge S3 artifacts
+    _require(GRAPHS_BUCKET, "GRAPHS_BUCKET not set")
+    graphs_prefix = f"graphs/{scenario_id}/"
+    gtfs_prefix = f"gtfs/{scenario_id}/"
+
+    try:
+        graphs_res = _delete_prefix(GRAPHS_BUCKET, graphs_prefix)
+        gtfs_res = _delete_prefix(GRAPHS_BUCKET, gtfs_prefix)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 delete failed: {e}")
+
+    return {
+        "status": "success",
+        "deleted": {
+            "graphs_prefix": graphs_prefix,
+            "graphs_result": graphs_res,
+            "gtfs_prefix": gtfs_prefix,
+            "gtfs_result": gtfs_res,
+        },
+    }
+
