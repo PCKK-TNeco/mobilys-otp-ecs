@@ -10,6 +10,10 @@ from app.ecs_control import (
 )
 from botocore.exceptions import ClientError
 from typing import Literal
+import time
+import asyncio
+import socket
+from fastapi import Response
 
 app = FastAPI()
 
@@ -35,7 +39,22 @@ SNIPPETS_DIR = os.getenv("NGINX_SNIPPETS_DIR", "/shared/nginx/routers").rstrip("
 LOG_GROUP_BUILDER = os.getenv("LOG_GROUP_BUILDER", "/mobilys-otp/builder")
 LOG_GROUP_ROUTER  = os.getenv("LOG_GROUP_ROUTER", "/mobilys-otp/router")
 
-s3 = boto3.client("s3", region_name=AWS_REGION)
+ecs = boto3.client("ecs", region_name=AWS_REGION)
+
+# Idle after which we scale to 0 (seconds). Override with env ROUTER_IDLE_SECONDS if you want.
+IDLE_SECS = int(os.getenv("ROUTER_IDLE_SECONDS", "1800"))  # 15 minutes
+_last_hit = {}  # scenario_id -> last epoch seconds
+
+def _tcp_check(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def _router_host(sid: str) -> str:
+    # must match the host used in site.conf
+    return f"router-{sid}.mobilys-staging.mobilys-otp.local"
 
 
 def _require(cond, msg):
@@ -117,6 +136,72 @@ def _delete_prefix(bucket: str, prefix: str) -> dict:
         if _bucket_is_versioned(bucket)
         else _delete_prefix_unversioned(bucket, prefix)
     )
+
+@app.get("/api/router_warmup")
+def router_warmup(rid: str, resp: Response):
+    """
+    - Record 'last used' for rid
+    - Ensure ECS service router-<rid> is running (desiredCount=1) or create it
+    - Wait until TCP :8081 on router host is reachable
+    - Return 204 (no body) so Nginx auth_request can proceed
+    """
+    now = time.time()
+    _last_hit[rid] = now
+
+    service_name = f"router-{rid}"
+
+    try:
+        # Try to scale an existing service up
+        ecs.update_service(
+            cluster=ECS_CLUSTER_ARN,
+            service=service_name,
+            desiredCount=1,
+        )
+        waiter = ecs.get_waiter("services_stable")
+        waiter.wait(
+            cluster=ECS_CLUSTER_ARN,
+            services=[service_name],
+            WaiterConfig={"Delay": 5, "MaxAttempts": 60},
+        )
+    except ecs.exceptions.ServiceNotFoundException:
+        # Create on demand
+        ensure_router_service(
+            region=AWS_REGION,
+            cluster_arn=ECS_CLUSTER_ARN,
+            subnets=ECS_SUBNETS,
+            security_groups=ECS_SGS,
+            cloudmap_namespace_id=CLOUDMAP_NAMESPACE_ID,
+            service_prefix="router",
+            scenario_id=rid,
+            task_family=ROUTER_TASK_FAMILY,
+            task_exec_role_arn=TASK_EXEC_ROLE_ARN,
+            task_role_arn=TASK_ROLE_ARN,
+            image=ROUTER_IMAGE,
+            env={
+                "AWS_REGION": AWS_REGION,
+                "GRAPHS_BUCKET": GRAPHS_BUCKET,
+                "GRAPH_SCENARIO_ID": rid,
+            },
+            desired_count=1,
+            container_port=8081,
+            cw_log_group=LOG_GROUP_ROUTER,
+        )
+    except Exception as e:
+        print("[warmup] update/create failed:", repr(e))
+        resp.status_code = 503
+        return {"error": "router_warmup_failed", "detail": str(e)}
+
+    # DNS may need a moment; wait for socket to open
+    host = _router_host(rid)
+    start = time.time()
+    while time.time() - start < 300:
+        if _tcp_check(host, 8081):
+            resp.status_code = 204  # required by auth_request
+            return
+        time.sleep(2.0)
+
+    resp.status_code = 504
+    return {"error": "router_start_timeout"}
 
 
 @app.get("/s3/pbf_files")
@@ -275,3 +360,28 @@ async def delete_graph(scenario_id: str = Form(...)):
         },
     }
 
+async def _idle_reaper_loop():
+    while True:
+        try:
+            now = time.time()
+            stale = [rid for rid, ts in _last_hit.items() if now - ts > IDLE_SECS]
+            for rid in stale:
+                svc = f"router-{rid}"
+                print(f"[idle-reaper] scaling down {svc}")
+                try:
+                    ecs.update_service(
+                        cluster=ECS_CLUSTER_ARN,
+                        service=svc,
+                        desiredCount=0,
+                    )
+                except Exception as e:
+                    print(f"[idle-reaper] update_service({svc}) failed: {e}")
+                _last_hit.pop(rid, None)
+        except Exception as e:
+            print("[idle-reaper] loop error:", e)
+
+        await asyncio.sleep(60)  # check every minute
+
+@app.on_event("startup")
+async def _start_idle_reaper():
+    asyncio.create_task(_idle_reaper_loop())
