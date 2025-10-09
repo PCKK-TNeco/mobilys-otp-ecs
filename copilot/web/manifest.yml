@@ -32,6 +32,7 @@ sidecars:
     mount_points:
       - source_volume: shared
         path: /shared
+        read_only: false 
 
 # Runtime env for the nginx container
 variables:
@@ -49,5 +50,6 @@ storage:
 mount_points:
   - source_volume: shared
     path: /shared
+    read_only: false
 
 

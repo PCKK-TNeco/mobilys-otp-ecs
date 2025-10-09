@@ -1,7 +1,7 @@
 # app/main.py
 import os
 import boto3
-from fastapi import FastAPI, UploadFile, Form, File, HTTPException
+from fastapi import FastAPI, UploadFile, Form, File, HTTPException, Query
 
 from app.ecs_control import (
     submit_builder_and_wait,
@@ -9,7 +9,7 @@ from app.ecs_control import (
     delete_router_service,
 )
 from botocore.exceptions import ClientError
-from typing import Literal
+from typing import Literal, Optional
 import time
 import asyncio
 import socket
@@ -39,6 +39,7 @@ SNIPPETS_DIR = os.getenv("NGINX_SNIPPETS_DIR", "/shared/nginx/routers").rstrip("
 LOG_GROUP_BUILDER = os.getenv("LOG_GROUP_BUILDER", "/mobilys-otp/builder")
 LOG_GROUP_ROUTER  = os.getenv("LOG_GROUP_ROUTER", "/mobilys-otp/router")
 
+s3  = boto3.client("s3",  region_name=AWS_REGION)
 ecs = boto3.client("ecs", region_name=AWS_REGION)
 
 # Idle after which we scale to 0 (seconds). Override with env ROUTER_IDLE_SECONDS if you want.
@@ -78,6 +79,8 @@ location /router/{scenario_id}/ {{
         f.write(conf)
     return path
 
+def _graph_id(sid: str, gtype: str) -> str:
+    return f"{sid}-{gtype}"
 
 def _remove_nginx_snippet(scenario_id: str):
     try:
@@ -205,25 +208,50 @@ def router_warmup(rid: str, resp: Response):
 
 
 @app.get("/s3/pbf_files")
-def list_pbf_files(bucket: str):
-
+def list_pbf_files(
+    bucket: str,
+    file_type: Literal["osm", "drm"] = Query("osm", alias="type"),
+):
     _require(bucket, "Bucket name is required")
+
+    # pick folder + extension based on type
+    prefix = "preloaded_osm_files" if file_type == "osm" else "preloaded_drm_files"
+    ext = ".osm.pbf" if file_type == "osm" else ".osm"
+
+    items = set()
     try:
-        resp = s3.list_objects_v2(Bucket=bucket)
+        token = None
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": f"{prefix}/"}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = s3.list_objects_v2(**kwargs)
+
+            for obj in resp.get("Contents", []):
+                key = obj["Key"]
+
+                if not key.lower().endswith(ext):
+                    continue
+                name = key.rsplit("/", 1)[-1]        # filename only
+                base = name[: -len(ext)]             # strip suffix (case-insensitive safe)
+                if base:
+                    items.add(base)
+
+            if resp.get("IsTruncated"):
+                token = resp.get("NextContinuationToken")
+            else:
+                break
+
     except s3.exceptions.NoSuchBucket:
         raise HTTPException(status_code=404, detail=f"Bucket '{bucket}' not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    items = []
-    for obj in resp.get("Contents", []):
-        key = obj["Key"]
-        if key.lower().endswith((".pbf", ".osm")):
-            name = key.rsplit("/", 1)[-1]  # take only the filename
-            base = os.path.splitext(name)[0]
-            items.append(base)
+    return {
+        "folder": prefix,
+        "file_names": sorted(items),
+    }
 
-    return {"file_names": sorted(items)}
 
 
 @app.get("/health")
@@ -236,7 +264,7 @@ async def build_graph(
     scenario_id: str = Form(...),
     prefecture: str = Form(...),
     gtfs_file: UploadFile = File(...),
-    graph_type: Literal["osm", "drm"] = Form("osm", alias="type"),  # <-- NEW
+    graph_type: Literal["osm", "drm"] = Form("osm")
 ):
     """Synchronous: build Graph.obj in a one-off task, then bring up router service and route traffic."""
     _require(GRAPHS_BUCKET, "GRAPHS_BUCKET not set")
@@ -252,9 +280,12 @@ async def build_graph(
     else:  # "drm"
         osm_prefix = "preloaded_drm_files"
         osm_ext = ".osm"
+    print("continue with this graph_type", graph_type, osm_prefix, osm_ext)
 
-    # Upload GTFS to s3://bucket/gtfs/<scenario>/<filename>
-    gtfs_key = f"gtfs/{scenario_id}/{gtfs_file.filename}"
+    graph_id = _graph_id(scenario_id, graph_type)
+
+    # Upload GTFS to s3://bucket/gtfs/<scenario>-<type>/<filename>
+    gtfs_key = f"gtfs/{graph_id}/{gtfs_file.filename}"
     s3.upload_fileobj(gtfs_file.file, GRAPHS_BUCKET, gtfs_key)
 
     # Run builder task and wait
@@ -274,7 +305,7 @@ async def build_graph(
             "GRAPHS_BUCKET": GRAPHS_BUCKET,
             "OSM_PREFIX": osm_prefix, 
             "OSM_EXT": osm_ext, 
-            "SCENARIO_ID": scenario_id,
+            "SCENARIO_ID": graph_id,
             "PREFECTURE": prefecture,
             "S3_GTFS_URI": f"s3://{GRAPHS_BUCKET}/{gtfs_key}",
             "JAVA_TOOL_OPTIONS": "-Xmx8g -XX:+UseG1GC",
@@ -295,7 +326,7 @@ async def build_graph(
             security_groups=ECS_SGS,
             cloudmap_namespace_id=CLOUDMAP_NAMESPACE_ID,
             service_prefix="router",
-            scenario_id=scenario_id,
+            scenario_id=graph_id,
             task_family=ROUTER_TASK_FAMILY,
             task_exec_role_arn=TASK_EXEC_ROLE_ARN,
             task_role_arn=TASK_ROLE_ARN,
@@ -303,7 +334,7 @@ async def build_graph(
             env={
                 "AWS_REGION": AWS_REGION,
                 "GRAPHS_BUCKET": GRAPHS_BUCKET,
-                "GRAPH_SCENARIO_ID": scenario_id,
+                "GRAPH_SCENARIO_ID": graph_id,
             },
             desired_count=1,
             container_port=8081,
@@ -320,45 +351,55 @@ async def build_graph(
     print(f"[router] ensure_router_service OK; dns={dns}")
 
     # Add nginx route (hot-reload sidecar handles reload)
-    _write_nginx_snippet(scenario_id, dns, 8081)
+    _write_nginx_snippet(graph_id, dns, 8081)
 
-    return {"status": "success", "router_path": f"/router/{scenario_id}/"}
+    return {"status": "success", "router_path": f"/router/{graph_id}/"}
+
 
 @app.post("/delete_graph")
 async def delete_graph(scenario_id: str = Form(...)):
-    # 1) Kill the router service (ignore if it's already gone)
-    try:
-        delete_router_service(
-            region=AWS_REGION,
-            cluster_arn=ECS_CLUSTER_ARN,
-            service_name=f"router-{scenario_id}",
-        )
-    except Exception as e:
-        print(f"[delete_graph] delete_router_service warning: {e}")
+    # 1) Kill any router services that might exist
+    svc_names = [
+        f"router-{scenario_id}",        # legacy (no type)
+        f"router-{scenario_id}-osm",    # OSM variant
+        f"router-{scenario_id}-drm",    # DRM variant
+    ]
+    for svc in svc_names:
+        try:
+            delete_router_service(
+                region=AWS_REGION,
+                cluster_arn=ECS_CLUSTER_ARN,
+                service_name=svc,
+            )
+        except Exception as e:
+            print(f"[delete_graph] delete_router_service({svc}) warning: {e}")
 
-    # 2) Remove nginx snippet
-    _remove_nginx_snippet(scenario_id)
+    # 2) Remove any nginx snippets
+    for name in [scenario_id, f"{scenario_id}-osm", f"{scenario_id}-drm"]:
+        try:
+            os.remove(f"{SNIPPETS_DIR}/{name}.conf")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[delete_graph] remove snippet {name}.conf warning: {e}")
 
-    # 3) Purge S3 artifacts
+    # 3) Purge S3 artifacts for all possible prefixes
     _require(GRAPHS_BUCKET, "GRAPHS_BUCKET not set")
-    graphs_prefix = f"graphs/{scenario_id}/"
-    gtfs_prefix = f"gtfs/{scenario_id}/"
+    prefixes = []
+    for base in [scenario_id, f"{scenario_id}-osm", f"{scenario_id}-drm"]:
+        prefixes.append(f"graphs/{base}/")
+        prefixes.append(f"gtfs/{base}/")
 
-    try:
-        graphs_res = _delete_prefix(GRAPHS_BUCKET, graphs_prefix)
-        gtfs_res = _delete_prefix(GRAPHS_BUCKET, gtfs_prefix)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"S3 delete failed: {e}")
+    deleted = {}
+    for p in prefixes:
+        try:
+            deleted[p] = _delete_prefix(GRAPHS_BUCKET, p)
+        except Exception as e:
+            deleted[p] = {"error": str(e)}
 
-    return {
-        "status": "success",
-        "deleted": {
-            "graphs_prefix": graphs_prefix,
-            "graphs_result": graphs_res,
-            "gtfs_prefix": gtfs_prefix,
-            "gtfs_result": gtfs_res,
-        },
-    }
+    return {"status": "success", "deleted": deleted}
+
+
 
 async def _idle_reaper_loop():
     while True:
